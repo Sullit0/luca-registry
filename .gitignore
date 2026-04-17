@@ -1,0 +1,10 @@
+bin/
+obj/
+data/
+*.db
+*.db-journal
+.vs/
+.vscode/
+.idea/
+*.user
+publish/
