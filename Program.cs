@@ -533,48 +533,24 @@ h2{{font-size:28px;font-weight:600;margin:0 0 18px}}
 <div class=""role"">Rol: <strong>{safeRole}</strong></div>
 <div class=""status"">Owner: {statusBadge}</div>
 
-<div id=""install-prompt"" style=""display:none"">
-  <p>No tenés Luca instalado. Bajalo desde el servidor del estudio:</p>
+<p>Para entrar tenés 2 caminos según si ya tenés Luca instalado:</p>
+
+<div style=""margin-top:20px"">
+  <h3 style=""font-size:15px;color:#aaa;margin:0 0 10px;text-transform:uppercase;letter-spacing:1px"">Si ya tenés Luca</h3>
+  <p class=""muted"">Abrí Luca, andá a <strong>""Tengo un código de invitación""</strong> y pegá:</p>
+  <div class=""code-box"">{safeCode}</div>
+</div>
+
+<div style=""margin-top:30px"">
+  <h3 style=""font-size:15px;color:#aaa;margin:0 0 10px;text-transform:uppercase;letter-spacing:1px"">Si no tenés Luca</h3>
+  <p class=""muted"">Bajalo desde el servidor del estudio (el OWNER lo está alojando):</p>
   <a class=""btn"" href=""{msiHref}"" download>Descargar Luca para Windows</a>
   <a class=""btn btn-secondary"" href=""{macHref}"" download>Descargar Luca para Mac (Apple Silicon)</a>
   {downloadsDisabled}
-  <p class=""muted"">Después de instalar, abrí Luca y pegá este código:</p>
-  <div class=""code-box"">{safeCode}</div>
-</div>
-
-<div id=""open-prompt"">
-  <p>Abriendo Luca…</p>
-  <a class=""btn"" id=""manual-open"" href=""luca://join/{safeCode}"">Si no abrió, click acá</a>
-  <p class=""muted"">¿No tenés Luca? <a href=""#"" id=""show-install"" style=""color:#3b82f6"">Descargalo acá</a>.</p>
-  <p class=""muted"">O pegá el código en la app:</p>
-  <div class=""code-box"">{safeCode}</div>
+  <p class=""muted"">Después de instalar, abrí la app y pegá el código que ves arriba.</p>
 </div>
 
 <div class=""foot"">Luca — plataforma para estudios contables. Tu data vive en tu máquina, no en la nube.</div>
-
-<script>
-(function(){{
-  const installPrompt = document.getElementById('install-prompt');
-  const openPrompt = document.getElementById('open-prompt');
-  document.getElementById('show-install').addEventListener('click', e => {{
-    e.preventDefault();
-    installPrompt.style.display = 'block';
-    openPrompt.style.display = 'none';
-  }});
-  // Try the deep link. If app installed it intercepts, this page stays in
-  // background. If not, navigation just fails silently and we show install
-  // prompt after a short timeout.
-  const start = Date.now();
-  window.location.href = 'luca://join/{safeCode}';
-  setTimeout(() => {{
-    // If the page is still visible 2.5s later, app didn't intercept.
-    if (Date.now() - start > 2400 && !document.hidden) {{
-      installPrompt.style.display = 'block';
-      openPrompt.style.display = 'none';
-    }}
-  }}, 2500);
-}})();
-</script>
 </body></html>";
     }
 
