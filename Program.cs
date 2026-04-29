@@ -219,6 +219,50 @@ app.MapGet("/r/{machineId}/{code}", async (string machineId, string code) =>
     return Results.Redirect(target, permanent: false);
 });
 
+// GET /j/{code} — smart invite link.
+// PUBLIC, sin auth. El owner manda este URL por WhatsApp/email. El invitado
+// hace click → este HTML se carga, intenta abrir luca:// (deep-link a la app
+// si está instalada), y si falla en 1.5s redirige al download. Bonus: muestra
+// nombre del estudio + rol antes de abrir nada.
+app.MapGet("/j/{code}", async (string code) =>
+{
+    var normalizedCode = NormalizeCode(code);
+    if (normalizedCode is null)
+        return Results.Content(InviteHtml.Invalid("Código de invitación inválido."),
+            "text/html; charset=utf-8", System.Text.Encoding.UTF8);
+
+    using var conn = new SqliteConnection(connString);
+    await conn.OpenAsync();
+    var cmd = conn.CreateCommand();
+    cmd.CommandText = """
+        SELECT c.machine_id, c.expires_at, c.estudio_nombre, c.role, h.last_seen
+        FROM invitation_codes c
+        LEFT JOIN hosts h ON h.machine_id = c.machine_id
+        WHERE c.code = $code;
+    """;
+    cmd.Parameters.AddWithValue("$code", normalizedCode);
+    using var reader = await cmd.ExecuteReaderAsync();
+
+    if (!await reader.ReadAsync())
+        return Results.Content(InviteHtml.Invalid(
+            "Esta invitación no existe o ya fue eliminada."),
+            "text/html; charset=utf-8", System.Text.Encoding.UTF8);
+
+    var expiresAt = DateTime.SpecifyKind(DateTime.Parse(reader.GetString(1)), DateTimeKind.Utc);
+    if (expiresAt < DateTime.UtcNow)
+        return Results.Content(InviteHtml.Invalid("Esta invitación expiró."),
+            "text/html; charset=utf-8", System.Text.Encoding.UTF8);
+
+    var estudioNombre = reader.IsDBNull(2) ? "Estudio Luca" : reader.GetString(2);
+    var role = reader.IsDBNull(3) ? "miembro" : reader.GetString(3);
+    var ownerOnline = !reader.IsDBNull(4) &&
+        IsOnline(DateTime.SpecifyKind(DateTime.Parse(reader.GetString(4)), DateTimeKind.Utc));
+
+    return Results.Content(
+        InviteHtml.SmartLink(normalizedCode, estudioNombre, role, ownerOnline),
+        "text/html; charset=utf-8", System.Text.Encoding.UTF8);
+});
+
 // GET /registry/list — admin/debug view (returns all hosts)
 app.MapGet("/registry/list", async () =>
 {
@@ -436,3 +480,97 @@ public record CodeLookupResponse(
     string? Role,
     string OwnerStatus,
     DateTime ExpiresAt);
+
+// HTML helpers para /j/{code} smart-link page.
+public static class InviteHtml
+{
+    public static string SmartLink(string code, string estudioNombre, string role, bool ownerOnline)
+    {
+        var safeCode    = System.Net.WebUtility.HtmlEncode(code);
+        var safeEstudio = System.Net.WebUtility.HtmlEncode(estudioNombre);
+        var safeRole    = System.Net.WebUtility.HtmlEncode(role);
+        var statusBadge = ownerOnline
+            ? "<span style='color:#86efac'>● online</span>"
+            : "<span style='color:#f59e0b'>● offline (el owner no está conectado ahora)</span>";
+
+        return $@"<!DOCTYPE html>
+<html lang=""es""><head><meta charset=""utf-8""><meta name=""viewport"" content=""width=device-width,initial-scale=1"">
+<title>Invitación a {safeEstudio} — Luca</title>
+<style>
+*{{box-sizing:border-box}}
+body{{font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:520px;margin:60px auto;padding:24px;background:#0a0a0a;color:#e5e5e5;line-height:1.5}}
+h1{{font-size:14px;font-weight:500;color:#888;margin:0 0 6px;text-transform:uppercase;letter-spacing:1px}}
+h2{{font-size:28px;font-weight:600;margin:0 0 18px}}
+.role{{font-size:14px;color:#aaa;margin-bottom:24px}}
+.code-box{{background:#1a1a1a;padding:14px 16px;border-radius:8px;font-family:'Cascadia Code',Consolas,monospace;font-size:18px;text-align:center;letter-spacing:2px;border:1px solid #2a2a2a;font-weight:600;margin:20px 0}}
+.btn{{display:block;background:#3b82f6;color:#fff;padding:14px 22px;border-radius:8px;font-weight:600;font-size:15px;text-decoration:none;text-align:center;border:none;cursor:pointer;width:100%;margin-top:12px}}
+.btn:hover{{background:#2563eb}}
+.btn-secondary{{background:#27272a}}
+.btn-secondary:hover{{background:#3a3a3a}}
+.muted{{color:#888;font-size:13px;margin-top:18px}}
+.status{{font-size:13px;margin-bottom:20px}}
+.foot{{margin-top:32px;padding-top:16px;border-top:1px solid #1a1a1a;color:#666;font-size:12px}}
+</style></head><body>
+
+<h1>Invitación a estudio Luca</h1>
+<h2>{safeEstudio}</h2>
+<div class=""role"">Rol: <strong>{safeRole}</strong></div>
+<div class=""status"">Owner: {statusBadge}</div>
+
+<div id=""install-prompt"" style=""display:none"">
+  <p>No tenés Luca instalado. Bajalo:</p>
+  <a class=""btn"" href=""https://github.com/Sullit0/luca/releases/latest/download/Luca-Setup-1.0.0.msi"" download>Descargar Luca para Windows</a>
+  <a class=""btn btn-secondary"" href=""https://github.com/Sullit0/luca/releases/latest/download/Luca-mac-arm64.tar.gz"" download>Descargar Luca para Mac (Apple Silicon)</a>
+  <p class=""muted"">Después de instalar, abrí Luca y pegá este código:</p>
+  <div class=""code-box"">{safeCode}</div>
+</div>
+
+<div id=""open-prompt"">
+  <p>Abriendo Luca…</p>
+  <a class=""btn"" id=""manual-open"" href=""luca://join/{safeCode}"">Si no abrió, click acá</a>
+  <p class=""muted"">¿No tenés Luca? <a href=""#"" id=""show-install"" style=""color:#3b82f6"">Descargalo acá</a>.</p>
+  <p class=""muted"">O pegá el código en la app:</p>
+  <div class=""code-box"">{safeCode}</div>
+</div>
+
+<div class=""foot"">Luca — plataforma para estudios contables. Tu data vive en tu máquina, no en la nube.</div>
+
+<script>
+(function(){{
+  const installPrompt = document.getElementById('install-prompt');
+  const openPrompt = document.getElementById('open-prompt');
+  document.getElementById('show-install').addEventListener('click', e => {{
+    e.preventDefault();
+    installPrompt.style.display = 'block';
+    openPrompt.style.display = 'none';
+  }});
+  // Try the deep link. If app installed it intercepts, this page stays in
+  // background. If not, navigation just fails silently and we show install
+  // prompt after a short timeout.
+  const start = Date.now();
+  window.location.href = 'luca://join/{safeCode}';
+  setTimeout(() => {{
+    // If the page is still visible 2.5s later, app didn't intercept.
+    if (Date.now() - start > 2400 && !document.hidden) {{
+      installPrompt.style.display = 'block';
+      openPrompt.style.display = 'none';
+    }}
+  }}, 2500);
+}})();
+</script>
+</body></html>";
+    }
+
+    public static string Invalid(string mensaje)
+    {
+        var safe = System.Net.WebUtility.HtmlEncode(mensaje);
+        return $@"<!DOCTYPE html>
+<html lang=""es""><head><meta charset=""utf-8""><title>Invitación inválida — Luca</title>
+<style>body{{font-family:system-ui;max-width:480px;margin:80px auto;padding:24px;background:#0a0a0a;color:#e5e5e5;text-align:center}}h1{{font-size:22px}}.muted{{color:#888;font-size:14px;margin-top:18px}}</style>
+</head><body>
+<h1>Invitación inválida</h1>
+<p>{safe}</p>
+<p class=""muted"">Pedile al OWNER del estudio una invitación nueva.</p>
+</body></html>";
+    }
+}
