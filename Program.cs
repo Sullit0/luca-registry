@@ -159,6 +159,44 @@ app.MapGet("/registry/locate/{machineId}", async (string machineId) =>
         Status: IsOnline(lastSeen) ? "online" : "offline"));
 });
 
+// GET /r/{machineId}/{code} — stable invite link.
+// 302 redirect a {currentTunnelUrl}/join/{code}. Esto hace que los links de
+// invitación NUNCA mueran: el host es el registry estable, no el tunnel
+// efímero del owner. El owner puede rotar tunnel 100 veces y el link sigue
+// llevando al lugar correcto porque la resolución es just-in-time.
+app.MapGet("/r/{machineId}/{code}", async (string machineId, string code) =>
+{
+    var id = NormalizeMachineId(machineId);
+
+    using var conn = new SqliteConnection(connString);
+    await conn.OpenAsync();
+    var cmd = conn.CreateCommand();
+    cmd.CommandText = "SELECT tunnel_url, last_seen FROM hosts WHERE machine_id = $id;";
+    cmd.Parameters.AddWithValue("$id", id);
+    using var reader = await cmd.ExecuteReaderAsync();
+
+    if (!await reader.ReadAsync())
+        return Results.Content(
+            $"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Luca — Estudio offline</title>" +
+            $"<style>body{{font-family:system-ui;max-width:480px;margin:60px auto;padding:24px;background:#0a0a0a;color:#e5e5e5;text-align:center}}h1{{font-size:22px}}</style></head>" +
+            $"<body><h1>Estudio no encontrado</h1><p>Este link de invitación no corresponde a ningún estudio registrado. Pedile al OWNER una invitación nueva.</p></body></html>",
+            "text/html; charset=utf-8", System.Text.Encoding.UTF8);
+
+    var tunnelUrl = reader.GetString(0).TrimEnd('/');
+    var lastSeen = DateTime.SpecifyKind(DateTime.Parse(reader.GetString(1)), DateTimeKind.Utc);
+
+    if (!IsOnline(lastSeen))
+        return Results.Content(
+            $"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Luca — Estudio offline</title>" +
+            $"<style>body{{font-family:system-ui;max-width:480px;margin:60px auto;padding:24px;background:#0a0a0a;color:#e5e5e5;text-align:center}}h1{{font-size:22px}}.muted{{color:#888;font-size:14px;margin-top:16px}}</style></head>" +
+            $"<body><h1>El estudio está offline</h1><p>El servidor del estudio no está prendido en este momento. Pedile al OWNER que abra Luca y reintenta el link.</p>" +
+            $"<p class='muted'>Última conexión: {lastSeen:O}</p></body></html>",
+            "text/html; charset=utf-8", System.Text.Encoding.UTF8);
+
+    var target = $"{tunnelUrl}/join/{code}?m={id}";
+    return Results.Redirect(target, permanent: false);
+});
+
 // GET /registry/list — admin/debug view (returns all hosts)
 app.MapGet("/registry/list", async () =>
 {
