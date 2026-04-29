@@ -235,7 +235,7 @@ app.MapGet("/j/{code}", async (string code) =>
     await conn.OpenAsync();
     var cmd = conn.CreateCommand();
     cmd.CommandText = """
-        SELECT c.machine_id, c.expires_at, c.estudio_nombre, c.role, h.last_seen
+        SELECT c.machine_id, c.expires_at, c.estudio_nombre, c.role, h.last_seen, h.tunnel_url
         FROM invitation_codes c
         LEFT JOIN hosts h ON h.machine_id = c.machine_id
         WHERE c.code = $code;
@@ -257,9 +257,10 @@ app.MapGet("/j/{code}", async (string code) =>
     var role = reader.IsDBNull(3) ? "miembro" : reader.GetString(3);
     var ownerOnline = !reader.IsDBNull(4) &&
         IsOnline(DateTime.SpecifyKind(DateTime.Parse(reader.GetString(4)), DateTimeKind.Utc));
+    var tunnelUrl = reader.IsDBNull(5) ? null : reader.GetString(5).TrimEnd('/');
 
     return Results.Content(
-        InviteHtml.SmartLink(normalizedCode, estudioNombre, role, ownerOnline),
+        InviteHtml.SmartLink(normalizedCode, estudioNombre, role, ownerOnline, tunnelUrl),
         "text/html; charset=utf-8", System.Text.Encoding.UTF8);
 });
 
@@ -484,7 +485,7 @@ public record CodeLookupResponse(
 // HTML helpers para /j/{code} smart-link page.
 public static class InviteHtml
 {
-    public static string SmartLink(string code, string estudioNombre, string role, bool ownerOnline)
+    public static string SmartLink(string code, string estudioNombre, string role, bool ownerOnline, string? tunnelUrl)
     {
         var safeCode    = System.Net.WebUtility.HtmlEncode(code);
         var safeEstudio = System.Net.WebUtility.HtmlEncode(estudioNombre);
@@ -492,6 +493,20 @@ public static class InviteHtml
         var statusBadge = ownerOnline
             ? "<span style='color:#86efac'>● online</span>"
             : "<span style='color:#f59e0b'>● offline (el owner no está conectado ahora)</span>";
+
+        // Downloads se sirven desde el tunnel del owner ({tunnelUrl}/downloads/*).
+        // El MSI/tar.gz lo bakea cada owner local (mismo binario para todos
+        // pero hosteado por cada studio). Si el owner está offline, los
+        // downloads van a fallar — se muestra warning correspondiente.
+        var msiHref = !string.IsNullOrEmpty(tunnelUrl) && ownerOnline
+            ? $"{tunnelUrl}/downloads/luca-setup.msi"
+            : "#";
+        var macHref = !string.IsNullOrEmpty(tunnelUrl) && ownerOnline
+            ? $"{tunnelUrl}/downloads/luca-mac-arm64.tar.gz"
+            : "#";
+        var downloadsDisabled = !ownerOnline
+            ? "<p class='muted' style='color:#f59e0b'>El owner está offline — pedile que abra Luca y volvé a clickear el link.</p>"
+            : "";
 
         return $@"<!DOCTYPE html>
 <html lang=""es""><head><meta charset=""utf-8""><meta name=""viewport"" content=""width=device-width,initial-scale=1"">
@@ -507,6 +522,7 @@ h2{{font-size:28px;font-weight:600;margin:0 0 18px}}
 .btn:hover{{background:#2563eb}}
 .btn-secondary{{background:#27272a}}
 .btn-secondary:hover{{background:#3a3a3a}}
+.btn[href='#']{{opacity:0.4;pointer-events:none}}
 .muted{{color:#888;font-size:13px;margin-top:18px}}
 .status{{font-size:13px;margin-bottom:20px}}
 .foot{{margin-top:32px;padding-top:16px;border-top:1px solid #1a1a1a;color:#666;font-size:12px}}
@@ -518,9 +534,10 @@ h2{{font-size:28px;font-weight:600;margin:0 0 18px}}
 <div class=""status"">Owner: {statusBadge}</div>
 
 <div id=""install-prompt"" style=""display:none"">
-  <p>No tenés Luca instalado. Bajalo:</p>
-  <a class=""btn"" href=""https://github.com/Sullit0/luca/releases/latest/download/Luca-Setup-1.0.0.msi"" download>Descargar Luca para Windows</a>
-  <a class=""btn btn-secondary"" href=""https://github.com/Sullit0/luca/releases/latest/download/Luca-mac-arm64.tar.gz"" download>Descargar Luca para Mac (Apple Silicon)</a>
+  <p>No tenés Luca instalado. Bajalo desde el servidor del estudio:</p>
+  <a class=""btn"" href=""{msiHref}"" download>Descargar Luca para Windows</a>
+  <a class=""btn btn-secondary"" href=""{macHref}"" download>Descargar Luca para Mac (Apple Silicon)</a>
+  {downloadsDisabled}
   <p class=""muted"">Después de instalar, abrí Luca y pegá este código:</p>
   <div class=""code-box"">{safeCode}</div>
 </div>
