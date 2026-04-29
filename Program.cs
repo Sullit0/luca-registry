@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using Microsoft.Data.Sqlite;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -29,6 +30,17 @@ using (var conn = new SqliteConnection(connString))
             last_seen TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_hosts_last_seen ON hosts(last_seen);
+
+        CREATE TABLE IF NOT EXISTS invitation_codes (
+            code             TEXT PRIMARY KEY,
+            machine_id       TEXT NOT NULL,
+            expires_at       TEXT NOT NULL,
+            estudio_nombre   TEXT,
+            role             TEXT,
+            registered_at    TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_codes_machine ON invitation_codes(machine_id);
+        CREATE INDEX IF NOT EXISTS idx_codes_expires ON invitation_codes(expires_at);
     """;
     cmd.ExecuteNonQuery();
 }
@@ -37,6 +49,13 @@ using (var conn = new SqliteConnection(connString))
 // Helpers
 // ──────────────────────────────────────────────────────────────
 static string NormalizeMachineId(string id) => id.Trim().ToUpperInvariant();
+
+static string? NormalizeCode(string? code)
+{
+    if (string.IsNullOrWhiteSpace(code)) return null;
+    var normalized = code.Trim().ToUpperInvariant();
+    return Regex.IsMatch(normalized, "^INV-[A-Z0-9]{4}-[A-Z0-9]{4}$") ? normalized : null;
+}
 
 static bool IsOnline(DateTime lastSeenUtc) =>
     DateTime.UtcNow - lastSeenUtc < TimeSpan.FromMinutes(15);
@@ -49,11 +68,14 @@ app.MapGet("/", () => Results.Text(
     """
     Luca Registry — central registry for Luca on-premise instances.
     Endpoints:
-      POST /registry/register
-      POST /registry/heartbeat
-      GET  /registry/locate/{machineId}
-      GET  /registry/list
-      GET  /health
+      POST   /registry/register
+      POST   /registry/heartbeat
+      GET    /registry/locate/{machineId}
+      GET    /registry/list
+      POST   /codes
+      GET    /codes/{code}
+      DELETE /codes/{code}
+      GET    /health
     """, "text/plain"));
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok", time = DateTime.UtcNow }));
@@ -228,6 +250,141 @@ app.MapGet("/registry/list", async () =>
 });
 
 // ──────────────────────────────────────────────────────────────
+// Invitation codes — owner publishes a code → invitee resolves to estudio
+// ──────────────────────────────────────────────────────────────
+
+// POST /codes — owner publishes (or refreshes) an invitation code
+app.MapPost("/codes", async (CodeRegisterRequest req) =>
+{
+    var code = NormalizeCode(req.Code);
+    if (code is null)
+        return Results.BadRequest(new { error = "invalid_code_format" });
+
+    if (string.IsNullOrWhiteSpace(req.MachineId))
+        return Results.BadRequest(new { error = "machineId is required" });
+
+    var id = NormalizeMachineId(req.MachineId);
+
+    // expiresAt: parse as UTC, store as ISO-8601 ('o') for stable round-tripping
+    if (!DateTime.TryParse(req.ExpiresAt, null,
+            System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal,
+            out var expiresAt))
+        return Results.BadRequest(new { error = "invalid_expires_at" });
+    expiresAt = DateTime.SpecifyKind(expiresAt, DateTimeKind.Utc);
+
+    using var conn = new SqliteConnection(connString);
+    await conn.OpenAsync();
+
+    // Check host exists
+    var checkHost = conn.CreateCommand();
+    checkHost.CommandText = "SELECT 1 FROM hosts WHERE machine_id = $id;";
+    checkHost.Parameters.AddWithValue("$id", id);
+    var hostExists = await checkHost.ExecuteScalarAsync();
+    if (hostExists is null)
+        return Results.NotFound(new { error = "host_not_registered" });
+
+    // Check if code already owned by a different machine
+    var checkOwner = conn.CreateCommand();
+    checkOwner.CommandText = "SELECT machine_id FROM invitation_codes WHERE code = $code;";
+    checkOwner.Parameters.AddWithValue("$code", code);
+    var existingOwner = await checkOwner.ExecuteScalarAsync() as string;
+    if (existingOwner is not null && existingOwner != id)
+        return Results.Conflict(new { error = "code_owned_by_other_machine" });
+
+    var cmd = conn.CreateCommand();
+    cmd.CommandText = """
+        INSERT INTO invitation_codes (code, machine_id, expires_at, estudio_nombre, role, registered_at)
+        VALUES ($code, $id, $exp, $nom, $role, datetime('now'))
+        ON CONFLICT(code) DO UPDATE SET
+            machine_id = excluded.machine_id,
+            expires_at = excluded.expires_at,
+            estudio_nombre = excluded.estudio_nombre,
+            role = excluded.role;
+    """;
+    cmd.Parameters.AddWithValue("$code", code);
+    cmd.Parameters.AddWithValue("$id", id);
+    cmd.Parameters.AddWithValue("$exp", expiresAt.ToString("o"));
+    cmd.Parameters.AddWithValue("$nom", (object?)req.EstudioNombre ?? DBNull.Value);
+    cmd.Parameters.AddWithValue("$role", (object?)req.Role ?? DBNull.Value);
+    await cmd.ExecuteNonQueryAsync();
+
+    return Results.Ok(new { code, registered = true });
+});
+
+// GET /codes/{code} — invitee resolves a bare code to estudio + tunnel URL
+app.MapGet("/codes/{code}", async (string code) =>
+{
+    var c = NormalizeCode(code);
+    if (c is null)
+        return Results.BadRequest(new { error = "invalid_code_format" });
+
+    using var conn = new SqliteConnection(connString);
+    await conn.OpenAsync();
+    var cmd = conn.CreateCommand();
+    cmd.CommandText = """
+        SELECT ic.code, ic.machine_id, ic.expires_at, ic.estudio_nombre, ic.role,
+               h.tunnel_url, h.last_seen
+        FROM invitation_codes ic
+        LEFT JOIN hosts h ON h.machine_id = ic.machine_id
+        WHERE ic.code = $code;
+    """;
+    cmd.Parameters.AddWithValue("$code", c);
+    using var reader = await cmd.ExecuteReaderAsync();
+
+    if (!await reader.ReadAsync())
+        return Results.NotFound(new { error = "code_not_found" });
+
+    var expiresAt = DateTime.Parse(reader.GetString(2), null,
+        System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal);
+    if (expiresAt < DateTime.UtcNow)
+    {
+        reader.Close();
+        var del = conn.CreateCommand();
+        del.CommandText = "DELETE FROM invitation_codes WHERE code = $code;";
+        del.Parameters.AddWithValue("$code", c);
+        await del.ExecuteNonQueryAsync();
+        return Results.Json(new { error = "code_expired" }, statusCode: 410);
+    }
+
+    var machineId = reader.GetString(1);
+    var estudioNombre = reader.IsDBNull(3) ? null : reader.GetString(3);
+    var role = reader.IsDBNull(4) ? null : reader.GetString(4);
+    var tunnelUrl = reader.IsDBNull(5) ? null : reader.GetString(5);
+    var ownerStatus = "offline";
+    if (!reader.IsDBNull(6))
+    {
+        var lastSeen = DateTime.SpecifyKind(DateTime.Parse(reader.GetString(6)), DateTimeKind.Utc);
+        ownerStatus = IsOnline(lastSeen) ? "online" : "offline";
+    }
+
+    return Results.Ok(new CodeLookupResponse(
+        Code: c,
+        MachineId: machineId,
+        TunnelUrl: tunnelUrl,
+        EstudioNombre: estudioNombre,
+        Role: role,
+        OwnerStatus: ownerStatus,
+        ExpiresAt: expiresAt));
+});
+
+// DELETE /codes/{code} — owner unregisters a code (revoked / expired)
+app.MapDelete("/codes/{code}", async (string code) =>
+{
+    var c = NormalizeCode(code);
+    if (c is null)
+        return Results.BadRequest(new { error = "invalid_code_format" });
+
+    using var conn = new SqliteConnection(connString);
+    await conn.OpenAsync();
+    var cmd = conn.CreateCommand();
+    cmd.CommandText = "DELETE FROM invitation_codes WHERE code = $code;";
+    cmd.Parameters.AddWithValue("$code", c);
+    var rows = await cmd.ExecuteNonQueryAsync();
+
+    return rows == 0 ? Results.NotFound(new { error = "code_not_found" }) : Results.NoContent();
+});
+
+// ──────────────────────────────────────────────────────────────
 // Run — Render provides PORT env var
 // ──────────────────────────────────────────────────────────────
 var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
@@ -263,3 +420,19 @@ public record LocateResponse(
     DateTime RegisteredAt,
     DateTime LastSeen,
     string Status);
+
+public record CodeRegisterRequest(
+    string Code,
+    string MachineId,
+    string ExpiresAt,
+    string? EstudioNombre = null,
+    string? Role = null);
+
+public record CodeLookupResponse(
+    string Code,
+    string MachineId,
+    string? TunnelUrl,
+    string? EstudioNombre,
+    string? Role,
+    string OwnerStatus,
+    DateTime ExpiresAt);
