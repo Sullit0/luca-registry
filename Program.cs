@@ -526,6 +526,9 @@ h2{{font-size:28px;font-weight:600;margin:0 0 18px}}
 .muted{{color:#888;font-size:13px;margin-top:18px}}
 .status{{font-size:13px;margin-bottom:20px}}
 .foot{{margin-top:32px;padding-top:16px;border-top:1px solid #1a1a1a;color:#666;font-size:12px}}
+#trying-luca{{display:none;background:#1a1a1a;border:1px solid #2a2a2a;padding:18px;border-radius:8px;margin-bottom:20px;text-align:center}}
+.spinner{{display:inline-block;width:14px;height:14px;border:2px solid #444;border-top-color:#3b82f6;border-radius:50%;animation:spin 0.8s linear infinite;vertical-align:middle;margin-right:8px}}
+@keyframes spin{{to{{transform:rotate(360deg)}}}}
 </style></head><body>
 
 <h1>Invitación a estudio Luca</h1>
@@ -533,24 +536,53 @@ h2{{font-size:28px;font-weight:600;margin:0 0 18px}}
 <div class=""role"">Rol: <strong>{safeRole}</strong></div>
 <div class=""status"">Owner: {statusBadge}</div>
 
-<p>Para entrar tenés 2 caminos según si ya tenés Luca instalado:</p>
+<div id=""trying-luca""><span class=""spinner""></span>Intentando abrir Luca…</div>
 
-<div style=""margin-top:20px"">
-  <h3 style=""font-size:15px;color:#aaa;margin:0 0 10px;text-transform:uppercase;letter-spacing:1px"">Si ya tenés Luca</h3>
-  <p class=""muted"">Abrí Luca, andá a <strong>""Tengo un código de invitación""</strong> y pegá:</p>
-  <div class=""code-box"">{safeCode}</div>
-</div>
+<div id=""install-block"">
+  <p>Para entrar tenés 2 caminos según si ya tenés Luca instalado:</p>
 
-<div style=""margin-top:30px"">
-  <h3 style=""font-size:15px;color:#aaa;margin:0 0 10px;text-transform:uppercase;letter-spacing:1px"">Si no tenés Luca</h3>
-  <p class=""muted"">Bajalo desde el servidor del estudio (el OWNER lo está alojando):</p>
-  <a class=""btn"" href=""{msiHref}"" download>Descargar Luca para Windows</a>
-  <a class=""btn btn-secondary"" href=""{macHref}"" download>Descargar Luca para Mac (Apple Silicon)</a>
-  {downloadsDisabled}
-  <p class=""muted"">Después de instalar, abrí la app y pegá el código que ves arriba.</p>
+  <div style=""margin-top:20px"">
+    <h3 style=""font-size:15px;color:#aaa;margin:0 0 10px;text-transform:uppercase;letter-spacing:1px"">Si ya tenés Luca</h3>
+    <p class=""muted"">Abrí Luca, andá a <strong>""Tengo un código de invitación""</strong> y pegá:</p>
+    <div class=""code-box"">{safeCode}</div>
+    <a class=""btn btn-secondary"" href=""luca://join/{safeCode}"">Abrir Luca</a>
+  </div>
+
+  <div style=""margin-top:30px"">
+    <h3 style=""font-size:15px;color:#aaa;margin:0 0 10px;text-transform:uppercase;letter-spacing:1px"">Si no tenés Luca</h3>
+    <p class=""muted"">Bajalo desde el servidor del estudio (el OWNER lo está alojando):</p>
+    <a class=""btn"" href=""{msiHref}"" download>Descargar Luca para Windows</a>
+    <a class=""btn btn-secondary"" href=""{macHref}"" download>Descargar Luca para Mac (Apple Silicon)</a>
+    {downloadsDisabled}
+    <p class=""muted"">Después de instalar, volvé a este link y la app abrirá automáticamente con el código.</p>
+  </div>
 </div>
 
 <div class=""foot"">Luca — plataforma para estudios contables. Tu data vive en tu máquina, no en la nube.</div>
+
+<script>
+  // Auto-attempt luca:// con iframe oculto: si el handler está registrado, el OS
+  // captura el navigation y abre la app. Si no, el iframe falla silencioso (sin
+  // popup feo de 'no handler'). Si después de 1.5s seguimos enfocados, asumimos
+  // que la app no se abrió y mostramos el bloque de instalar/copiar código.
+  (function(){{
+    var trying = document.getElementById('trying-luca');
+    var install = document.getElementById('install-block');
+    install.style.display = 'none';
+    trying.style.display = 'block';
+
+    var iframe = document.createElement('iframe');
+    iframe.style.display = 'none';
+    iframe.src = 'luca://join/{safeCode}';
+    document.body.appendChild(iframe);
+
+    setTimeout(function(){{
+      try {{ document.body.removeChild(iframe); }} catch(e) {{}}
+      trying.style.display = 'none';
+      install.style.display = 'block';
+    }}, 1500);
+  }})();
+</script>
 </body></html>";
     }
 
