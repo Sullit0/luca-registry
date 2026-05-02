@@ -2,6 +2,7 @@ using System.Text.RegularExpressions;
 using Microsoft.Data.Sqlite;
 
 var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddHttpClient(); // para forwardear OAuth callbacks al owner tunnel
 var app = builder.Build();
 
 // ──────────────────────────────────────────────────────────────
@@ -79,6 +80,90 @@ app.MapGet("/", () => Results.Text(
     """, "text/plain"));
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok", time = DateTime.UtcNow }));
+
+// ──────────────────────────────────────────────────────────────
+// OAuth callback proxy — Google redirige acá (URL estable registrada UNA vez
+// en Google Console). Parsea el state ("<machineId>.<random>"), busca el tunnel
+// del owner, forwardea {code, state, redirect_uri} al server del owner.
+//
+// Sirve a TODOS los owners del mundo con un único redirect_uri en Google
+// Console. Sin esto cada owner necesitaría su propia URL stable o registrar
+// el localhost loopback.
+// ──────────────────────────────────────────────────────────────
+
+app.MapGet("/auth/cb", async (string? code, string? state, string? error, IHttpClientFactory http) =>
+{
+    if (!string.IsNullOrEmpty(error))
+        return Results.Content(OAuthHtml.Error($"Google devolvió error: {error}"),
+            "text/html; charset=utf-8", System.Text.Encoding.UTF8);
+
+    if (string.IsNullOrEmpty(code) || string.IsNullOrEmpty(state))
+        return Results.Content(OAuthHtml.Error("Faltan parámetros code/state."),
+            "text/html; charset=utf-8", System.Text.Encoding.UTF8);
+
+    // State format: "<machineId>.<random>". El registry SOLO lee la machineId
+    // para enrutear; la parte random sigue siendo CSPRNG validada por el owner.
+    var dotIdx = state.IndexOf('.');
+    if (dotIdx <= 0)
+        return Results.Content(OAuthHtml.Error("State inválido (formato inesperado)."),
+            "text/html; charset=utf-8", System.Text.Encoding.UTF8);
+
+    var machineId = NormalizeMachineId(state.Substring(0, dotIdx));
+
+    // Lookup tunnel del owner
+    string? tunnelUrl = null;
+    using (var conn = new SqliteConnection(connString))
+    {
+        await conn.OpenAsync();
+        var lookup = conn.CreateCommand();
+        lookup.CommandText = "SELECT tunnel_url, last_seen FROM hosts WHERE machine_id = $id;";
+        lookup.Parameters.AddWithValue("$id", machineId);
+        using var reader = await lookup.ExecuteReaderAsync();
+        if (await reader.ReadAsync())
+        {
+            tunnelUrl = reader.GetString(0).TrimEnd('/');
+            var lastSeen = DateTime.SpecifyKind(DateTime.Parse(reader.GetString(1)), DateTimeKind.Utc);
+            if (!IsOnline(lastSeen))
+                tunnelUrl = null;
+        }
+    }
+
+    if (tunnelUrl is null)
+        return Results.Content(OAuthHtml.Error("El estudio del owner está offline. Pedile que abra Luca y reintenta."),
+            "text/html; charset=utf-8", System.Text.Encoding.UTF8);
+
+    // Forwardear al owner. El redirect_uri que pasamos debe matchear el que
+    // se le dio a Google al iniciar el flow → recompongo la URL pública del
+    // registry porque acá nos llegan request hosts variables (dev vs prod).
+    var registryBase = Environment.GetEnvironmentVariable("LUCA_REGISTRY_PUBLIC_URL")
+                       ?? "https://luca-registry.onrender.com";
+    var redirectUri = $"{registryBase.TrimEnd('/')}/auth/cb";
+
+    var client = http.CreateClient();
+    client.Timeout = TimeSpan.FromSeconds(20);
+
+    var payload = new { code, state, redirect_uri = redirectUri };
+    HttpResponseMessage? resp = null;
+    try
+    {
+        resp = await client.PostAsJsonAsync($"{tunnelUrl}/auth/google/callback-from-registry", payload);
+    }
+    catch (Exception ex)
+    {
+        return Results.Content(OAuthHtml.Error($"No pude contactar al server del owner: {ex.Message}"),
+            "text/html; charset=utf-8", System.Text.Encoding.UTF8);
+    }
+
+    if (!resp.IsSuccessStatusCode)
+    {
+        var body = await resp.Content.ReadAsStringAsync();
+        return Results.Content(OAuthHtml.Error($"Owner rechazó el callback ({(int)resp.StatusCode}): {body}"),
+            "text/html; charset=utf-8", System.Text.Encoding.UTF8);
+    }
+
+    return Results.Content(OAuthHtml.Success(),
+        "text/html; charset=utf-8", System.Text.Encoding.UTF8);
+});
 
 // POST /registry/register — first-time registration
 app.MapPost("/registry/register", async (RegisterRequest req) =>
@@ -481,6 +566,35 @@ public record CodeLookupResponse(
     string? Role,
     string OwnerStatus,
     DateTime ExpiresAt);
+
+// HTML helpers para la página post-OAuth /auth/cb. Browser landea acá tras
+// Google → vemos success/error → user vuelve a la app (que ya recibió el JWT
+// vía polling al server del owner).
+public static class OAuthHtml
+{
+    public static string Success() => $$"""
+        <!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
+        <title>Luca — Sesión iniciada</title>
+        <style>body{font-family:-apple-system,Segoe UI,sans-serif;background:#0f1115;color:#e6e6e6;
+        display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+        .card{text-align:center;padding:2rem 3rem;background:#1a1d26;border-radius:12px;max-width:420px}
+        h1{margin:0 0 .5rem;font-size:1.4rem}p{margin:0;color:#9aa0ac;line-height:1.5}</style>
+        </head><body><div class="card"><h1>Sesión iniciada en Luca</h1>
+        <p>Podés cerrar esta ventana y volver a la aplicación.</p></div></body></html>
+        """;
+
+    public static string Error(string detail) => $$"""
+        <!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
+        <title>Luca — Error en login</title>
+        <style>body{font-family:-apple-system,Segoe UI,sans-serif;background:#0f1115;color:#e6e6e6;
+        display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+        .card{text-align:center;padding:2rem 3rem;background:#2a1d1d;border-radius:12px;max-width:480px}
+        h1{margin:0 0 .75rem;font-size:1.4rem;color:#fca5a5}
+        p{margin:0;color:#9aa0ac;line-height:1.5;word-break:break-word}</style>
+        </head><body><div class="card"><h1>No se pudo iniciar sesión</h1>
+        <p>{{System.Net.WebUtility.HtmlEncode(detail)}}</p></div></body></html>
+        """;
+}
 
 // HTML helpers para /j/{code} smart-link page.
 public static class InviteHtml
